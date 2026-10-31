@@ -2,17 +2,20 @@ import os
 import re
 import sys
 import time
+import json
+import hashlib
 import argparse
+from collections import deque
 from datetime import date
 from pathlib import Path
 
 import markdown as md
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import OpenAI, RateLimitError, AuthenticationError
 from playwright.sync_api import sync_playwright
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
+CACHE_FILE = OUTPUT_DIR / ".dryrun_cache.json"   # one hidden file holding finished dry runs, so reruns skip them
 
 # Make emoji print correctly on Windows terminals
 if hasattr(sys.stdout, "reconfigure"):
@@ -21,15 +24,22 @@ if hasattr(sys.stdout, "reconfigure"):
 # Load variables from .env before anything else runs
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
+# ---------- Settings (all overridable from .env) ----------
+API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY")
+BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+REASONING_EFFORT = os.getenv("LLM_REASONING", "low")      # low | medium | high (gpt-oss models only)
+TPM_BUDGET = int(os.getenv("LLM_TPM_BUDGET", "7000"))     # stay under Groq's 8K tokens/minute free limit
+MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "4000"))
+
+COOLDOWN_SECONDS = 60   # wait after an unexpected API error, then move on to the next file
+MAX_RETRIES = 3         # per-minute rate-limit retries for the same file
+MAX_LINES = 300         # reject very large files to control cost and keep traces accurate
+
 if not API_KEY:
     raise RuntimeError(
-        "GEMINI_API_KEY not found. Create a .env file with: GEMINI_API_KEY=your_key_here"
+        "No API key found. Create a .env file with: GROQ_API_KEY=your_key_here"
     )
-
-MODEL = "gemini-2.5-flash"
-COOLDOWN_SECONDS = 60  # wait this long after any API error, then move on
-MAX_LINES = 300  # reject very large files to control cost and keep traces accurate
 
 LANGUAGES = {
     ".java": "Java",
@@ -83,7 +93,7 @@ each loop, each method call). Finish with one final "🟩 FINAL OUTPUT" block.
     Use fenced code blocks only for code and printed output, and tables only for traces.
 """
 
-client = genai.Client(api_key=API_KEY)
+client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
 
 # ---------- Reading code ----------
@@ -102,18 +112,88 @@ def read_code(path_str: str) -> tuple[str, str]:
     return code, language
 
 
-# ---------- Gemini call ----------
+# ---------- LLM call + rate-limit handling ----------
 
-def dry_run(code: str, language: str = "Java") -> str:
-    response = client.models.generate_content(
+class TokenPacer:
+    """Keeps tokens-per-minute under budget by waiting before a request if needed."""
+
+    def __init__(self, budget: int, window: int = 60):
+        self.budget = budget
+        self.window = window
+        self.events = deque()      # (timestamp, tokens used)
+        self.estimate = 4000       # guess for the next request; updated after each call
+
+    def wait(self) -> None:
+        while True:
+            now = time.time()
+            while self.events and now - self.events[0][0] >= self.window:
+                self.events.popleft()
+            used = sum(t for _, t in self.events)
+            if not self.events or used + self.estimate <= self.budget:
+                return
+            pause = self.window - (now - self.events[0][0]) + 1
+            print(f"   Pacing: waiting {pause:.0f}s to stay under the token limit...")
+            time.sleep(max(pause, 1))
+
+    def record(self, tokens: int) -> None:
+        self.events.append((time.time(), tokens))
+        self.estimate = max(1500, tokens)
+
+
+pacer = TokenPacer(TPM_BUDGET)
+
+
+def dry_run(code: str, language: str = "Java") -> tuple[str, int]:
+    """Returns (markdown text, total tokens used)."""
+    kwargs = dict(
         model=MODEL,
-        contents=f"Language: {language}\n\nDry run this code:\n\n```{language.lower()}\n{code}\n```",
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.2,
-        ),
+        temperature=0.2,
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",
+             "content": f"Language: {language}\n\nDry run this code:\n\n```{language.lower()}\n{code}\n```"},
+        ],
     )
-    return response.text
+    if "gpt-oss" in MODEL:
+        kwargs["extra_body"] = {"reasoning_effort": REASONING_EFFORT}
+
+    response = client.chat.completions.create(**kwargs)
+    choice = response.choices[0]
+    text = choice.message.content or ""
+
+    if choice.finish_reason == "length":
+        text += ("\n\n🟥 NOTE\n\nThe model's answer was cut off because it hit the output limit. "
+                 "Increase LLM_MAX_OUTPUT_TOKENS in .env to get the full trace.")
+
+    tokens = response.usage.total_tokens if response.usage else pacer.estimate
+    return text, tokens
+
+
+def is_daily_limit(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "per day" in msg or "(tpd)" in msg or "(rpd)" in msg
+
+
+def retry_after_seconds(err: Exception, default: float = 60) -> float:
+    try:
+        value = err.response.headers.get("retry-after")
+        return max(float(value), 5) if value else default
+    except Exception:
+        return default
+
+
+# ---------- Saved results (one hidden JSON file, no .md files) ----------
+
+def load_cache() -> dict:
+    try:
+        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_cache(cache: dict) -> None:
+    CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
 
 
 # ---------- Formatting ----------
@@ -136,14 +216,6 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:10px;border-radius:6px;overflow-x:a
 code{font-family:Consolas,monospace}
 """
 
-
-def normalize(text: str) -> str:
-    """Ensure a blank line around each section marker so tables and code fences render."""
-    text = re.sub(rf"(?m)^([{MARKERS}][^\n]*)\n(?!\n)", r"\1\n\n", text)
-    text = re.sub(rf"(?m)([^\n])\n([{MARKERS}])", r"\1\n\n\2", text)
-    return text
-
-
 PDF_CSS = """
 @page{size:A4;margin:14mm}
 body{max-width:none;margin:0;background:#fff}
@@ -156,6 +228,13 @@ h1{font-family:Segoe UI,Arial,sans-serif;margin:0 0 4px}
 tr{break-inside:avoid}
 pre{white-space:pre-wrap;word-break:break-word}
 """
+
+
+def normalize(text: str) -> str:
+    """Ensure a blank line around each section marker so tables and code fences render."""
+    text = re.sub(rf"(?m)^([{MARKERS}][^\n]*)\n(?!\n)", r"\1\n\n", text)
+    text = re.sub(rf"(?m)([^\n])\n([{MARKERS}])", r"\1\n\n\2", text)
+    return text
 
 
 def to_body(text: str) -> str:
@@ -196,9 +275,11 @@ def collect_files(target: Path, recursive: bool) -> list[Path]:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dry run Java files using Gemini and save one PDF.")
+    parser = argparse.ArgumentParser(description="Dry run Java files with an LLM and save one PDF.")
     parser.add_argument("path", nargs="?", help="A Java file OR a folder containing Java files")
     parser.add_argument("-r", "--recursive", action="store_true", help="Also search sub-folders")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Ignore saved results and regenerate every file")
     args = parser.parse_args()
 
     target = Path((args.path or input("Enter path to a file or folder: "))
@@ -210,11 +291,15 @@ if __name__ == "__main__":
         sys.exit(0)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
+    cache = {} if args.fresh else load_cache()
     today = date.today().strftime("%Y-%m-%d")
     pdf_path = OUTPUT_DIR / f"DryRun_{today}.pdf"
+    print(f"Model: {MODEL}")
     print(f"Found {len(files)} file(s). Building: {pdf_path}\n")
 
-    programs, failed = [], []
+    programs, failed, not_attempted = [], [], []
+    daily_limit_hit = False
+
     for n, src in enumerate(files, start=1):
         print(f"[{n}/{len(files)}] {src.name}")
 
@@ -226,21 +311,53 @@ if __name__ == "__main__":
             print(f"   SKIPPED: {e}")
             continue
 
-        # API call: on any error, cool down for a minute, then go to the next file
-        try:
-            result = dry_run(code, language)
+        # Already done earlier (e.g. yesterday)? Reuse it, no API call needed
+        cache_key = f"{src.stem}_{hashlib.sha1(code.encode('utf-8')).hexdigest()[:8]}"
+        if cache_key in cache:
+            programs.append((src.name, to_body(cache[cache_key])))
+            print("   loaded from saved results")
+            continue
+
+        result = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            pacer.wait()
+            try:
+                result, tokens = dry_run(code, language)
+                pacer.record(tokens)
+                break
+            except AuthenticationError:
+                print("   Your API key was rejected. Check GROQ_API_KEY in .env.")
+                sys.exit(1)
+            except RateLimitError as e:
+                if is_daily_limit(e):
+                    daily_limit_hit = True
+                    print("   DAILY LIMIT reached.")
+                    break
+                wait = retry_after_seconds(e)
+                print(f"   Per-minute limit hit (attempt {attempt}/{MAX_RETRIES}). Waiting {wait:.0f}s...")
+                time.sleep(wait)
+            except Exception as e:
+                failed.append((src.name, str(e)))
+                print(f"   API ERROR: {e}")
+                if n < len(files):
+                    print(f"   Waiting {COOLDOWN_SECONDS}s before the next file...")
+                    time.sleep(COOLDOWN_SECONDS)
+                break
+        else:
+            failed.append((src.name, "still rate-limited after retries"))
+
+        if daily_limit_hit:
+            not_attempted = files[n - 1:]   # this file and everything after it
+            break
+
+        if result is not None:
+            cache[cache_key] = result
+            save_cache(cache)
             programs.append((src.name, to_body(result)))
             print("   done")
-            time.sleep(1)  # small pause between successful calls
-        except Exception as e:
-            failed.append((src.name, str(e)))
-            print(f"   API ERROR: {e}")
-            if n < len(files):
-                print(f"   Waiting {COOLDOWN_SECONDS}s before the next file...")
-                time.sleep(COOLDOWN_SECONDS)
 
     if not programs:
-        print("\nNothing to write: every file failed.")
+        print("\nNothing to write: no file succeeded.")
         sys.exit(1)
 
     with sync_playwright() as p:
@@ -251,6 +368,9 @@ if __name__ == "__main__":
         browser.close()
 
     print(f"\nSaved: {pdf_path.resolve()}")
-    print(f"{len(programs)} included, {len(failed)} failed.")
+    print(f"{len(programs)} included, {len(failed)} failed, {len(not_attempted)} not attempted.")
     for name, err in failed:
         print(f"  - {name}: {err}")
+    if daily_limit_hit:
+        print("\nThe free daily limit was reached. Run the same command again after it resets;")
+        print("finished files are remembered and will be reused, so only the remaining ones are sent.")
