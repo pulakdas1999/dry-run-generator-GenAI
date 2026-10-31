@@ -1,12 +1,17 @@
 import os
+import re
 import sys
+import time
 import argparse
+from datetime import date
 from pathlib import Path
+
+import markdown as md
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from playwright.sync_api import sync_playwright
 
-from datetime import datetime
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 
 # Make emoji print correctly on Windows terminals
@@ -23,6 +28,7 @@ if not API_KEY:
     )
 
 MODEL = "gemini-2.5-flash"
+COOLDOWN_SECONDS = 60  # wait this long after any API error, then move on
 MAX_LINES = 300  # reject very large files to control cost and keep traces accurate
 
 LANGUAGES = {
@@ -73,10 +79,14 @@ each loop, each method call). Finish with one final "🟩 FINAL OUTPUT" block.
    and state clearly at the top what you assumed.
 8. Do not rewrite or improve the code, and do not add theory. Only trace it.
 9. Output plain Markdown only. No intro like "Sure!" and no closing remarks.
+10. Put each section marker on its own line, followed by a blank line, then the content.
+    Use fenced code blocks only for code and printed output, and tables only for traces.
 """
 
 client = genai.Client(api_key=API_KEY)
 
+
+# ---------- Reading code ----------
 
 def read_code(path_str: str) -> tuple[str, str]:
     """Read the source file and return (code, language)."""
@@ -92,6 +102,8 @@ def read_code(path_str: str) -> tuple[str, str]:
     return code, language
 
 
+# ---------- Gemini call ----------
+
 def dry_run(code: str, language: str = "Java") -> str:
     response = client.models.generate_content(
         model=MODEL,
@@ -104,28 +116,141 @@ def dry_run(code: str, language: str = "Java") -> str:
     return response.text
 
 
+# ---------- Formatting ----------
+
+MARKERS = "🟦🟨🟩🟥"
+COLOURS = {"🟦": "blue", "🟨": "yellow", "🟩": "green", "🟥": "red"}
+
+CSS = """
+body{font-family:Segoe UI,Arial,sans-serif;max-width:900px;margin:30px auto;background:#f6f7f9;color:#222}
+.sec{border-left:6px solid;border-radius:6px;padding:4px 16px;margin:14px 0;background:#fff}
+.sec h4{margin:10px 0 6px}
+.blue{border-color:#3b82f6;background:#eff6ff}
+.yellow{border-color:#eab308;background:#fefce8}
+.green{border-color:#22c55e;background:#f0fdf4}
+.red{border-color:#ef4444;background:#fef2f2}
+table{border-collapse:collapse;margin:8px 0;width:100%}
+th,td{border:1px solid #cbd5e1;padding:6px 10px;text-align:left}
+th{background:#e2e8f0}
+pre{background:#1e1e2e;color:#cdd6f4;padding:10px;border-radius:6px;overflow-x:auto}
+code{font-family:Consolas,monospace}
+"""
+
+
+def normalize(text: str) -> str:
+    """Ensure a blank line around each section marker so tables and code fences render."""
+    text = re.sub(rf"(?m)^([{MARKERS}][^\n]*)\n(?!\n)", r"\1\n\n", text)
+    text = re.sub(rf"(?m)([^\n])\n([{MARKERS}])", r"\1\n\n\2", text)
+    return text
+
+
+PDF_CSS = """
+@page{size:A4;margin:14mm}
+body{max-width:none;margin:0;background:#fff}
+h1{font-family:Segoe UI,Arial,sans-serif;margin:0 0 4px}
+.date{color:#555;margin-bottom:18px}
+.program{break-before:page}
+.program:first-of-type{break-before:auto}
+.program h2{margin:0 0 10px;padding-bottom:6px;border-bottom:2px solid #cbd5e1}
+.sec{break-inside:auto}
+tr{break-inside:avoid}
+pre{white-space:pre-wrap;word-break:break-word}
+"""
+
+
+def to_body(text: str) -> str:
+    """Convert one dry-run Markdown result into coloured section blocks."""
+    chunks = re.split(rf"(?m)^(?=[{MARKERS}])", normalize(text))
+    body = ""
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+        cls = COLOURS.get(chunk.strip()[0], "")
+        first, _, rest = chunk.partition("\n")
+        html = md.markdown(rest, extensions=["tables", "fenced_code"])
+        body += f'<div class="sec {cls}"><h4>{first.strip()}</h4>{html}</div>\n'
+    return body
+
+
+def build_document(programs: list[tuple[str, str]], today: str) -> str:
+    """programs = [(file name, section html), ...] -> one HTML document."""
+    parts = "".join(
+        f'<section class="program"><h2>{name}</h2>{body}</section>\n'
+        for name, body in programs
+    )
+    return (
+        f"<html><head><meta charset='utf-8'><style>{CSS}{PDF_CSS}</style></head><body>"
+        f"<h1>Dry Run Report</h1><div class='date'>{today}</div>{parts}</body></html>"
+    )
+
+
+# ---------- Processing ----------
+
+def collect_files(target: Path, recursive: bool) -> list[Path]:
+    if target.is_dir():
+        pattern = "**/*.java" if recursive else "*.java"
+        return sorted(target.glob(pattern))
+    if target.is_file():
+        return [target]
+    raise FileNotFoundError(f"Path not found: {target}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dry run a source code file using Gemini.")
-    parser.add_argument("path", nargs="?", help="Path to the code file (e.g. Main.java)")
-    parser.add_argument("-o", "--output", help="Optional: custom path for the output .md file")
+    parser = argparse.ArgumentParser(description="Dry run Java files using Gemini and save one PDF.")
+    parser.add_argument("path", nargs="?", help="A Java file OR a folder containing Java files")
+    parser.add_argument("-r", "--recursive", action="store_true", help="Also search sub-folders")
     args = parser.parse_args()
 
-    path = args.path or input("Enter path to your code file: ")
-    path = path.strip().strip('"').strip("'")
+    target = Path((args.path or input("Enter path to a file or folder: "))
+                  .strip().strip('"').strip("'")).expanduser()
 
-    code, language = read_code(path)
-    result = dry_run(code, language)
-    print(result)
+    files = collect_files(target, args.recursive)
+    if not files:
+        print("No .java files found.")
+        sys.exit(0)
 
-    # Save into the outputs/ folder (created if missing)
-    if args.output:
-        out_path = Path(args.output)
-    else:
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = OUTPUT_DIR / f"{Path(path).stem}_dryrun_{stamp}.md"
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    today = date.today().strftime("%Y-%m-%d")
+    pdf_path = OUTPUT_DIR / f"DryRun_{today}.pdf"
+    print(f"Found {len(files)} file(s). Building: {pdf_path}\n")
 
-    out_path.write_text(result, encoding="utf-8")
-    print(f"\nSaved to: {out_path.resolve()}")
+    programs, failed = [], []
+    for n, src in enumerate(files, start=1):
+        print(f"[{n}/{len(files)}] {src.name}")
 
-# python .\main.py C:\Users\user\Downloads\JAVA_PRACTICE\practiceProgramsBlueJ\armstrongNumber.java
+        # Problems with the file itself (too long, unreadable): no need to wait
+        try:
+            code, language = read_code(str(src))
+        except Exception as e:
+            failed.append((src.name, str(e)))
+            print(f"   SKIPPED: {e}")
+            continue
+
+        # API call: on any error, cool down for a minute, then go to the next file
+        try:
+            result = dry_run(code, language)
+            programs.append((src.name, to_body(result)))
+            print("   done")
+            time.sleep(1)  # small pause between successful calls
+        except Exception as e:
+            failed.append((src.name, str(e)))
+            print(f"   API ERROR: {e}")
+            if n < len(files):
+                print(f"   Waiting {COOLDOWN_SECONDS}s before the next file...")
+                time.sleep(COOLDOWN_SECONDS)
+
+    if not programs:
+        print("\nNothing to write: every file failed.")
+        sys.exit(1)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.set_content(build_document(programs, today))
+        page.pdf(path=str(pdf_path), format="A4", print_background=True)
+        browser.close()
+
+    print(f"\nSaved: {pdf_path.resolve()}")
+    print(f"{len(programs)} included, {len(failed)} failed.")
+    for name, err in failed:
+        print(f"  - {name}: {err}")
