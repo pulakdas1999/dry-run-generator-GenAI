@@ -1,4 +1,4 @@
-"""
+r"""
 Dry-run VIDEO generator.
 
 For every Java file: the LLM returns a small JSON "storyboard" (one entry per executed step),
@@ -9,8 +9,8 @@ Install once:
     pip install openai python-dotenv pydantic pillow numpy imageio imageio-ffmpeg
 
 Run:
-    python main_video.py "C:\\path\\to\\File.java"
-    python main_video.py "C:\\path\\to\\folder" -r
+    python .\main_video.py "C:\Users\user\Downloads\JAVA_PRACTICE\practiceProgramsBlueJ\armstrongNumber.java"
+    python .\main_video.py "C:\Users\user\Downloads\JAVA_PRACTICE\practiceProgramsBlueJ" -r
 """
 import os
 import re
@@ -87,10 +87,10 @@ BAR_BG = (49, 50, 68)
 
 MAX_VARS = 8
 CODE_ROWS = 17
-OUT_ROWS = 5
+OUT_ROWS = 3
 
 SYSTEM_PROMPT = """
-You are a programming teacher. You receive source code with line numbers and produce an exact
+You are an expert programming teacher. You receive source code with line numbers and produce an exact
 DRY RUN as JSON. A program will turn your JSON into a short step-by-step video, so follow the
 format exactly.
 
@@ -103,7 +103,7 @@ Return ONLY one JSON object. No markdown fences, no text before or after it.
   "steps": [
     {
       "line": 12,
-      "explain": "one short sentence, max 18 words, using the real values",
+      "explain": "detailed step explaining the math/logic calculation using real values, e.g. 'Compute 153 % 10 = 3'",
       "changes": {"sum": "27"},
       "removed": [],
       "printed": "",
@@ -120,7 +120,7 @@ Rules:
    printing, method calls and returns, and every condition check of an if/while/for (use the
    line of the condition). Skip lines that do nothing (braces, comments, blank lines,
    declarations without a value).
-3. Never merge steps. Every loop iteration is traced in full, including the final failing
+3. Never merge steps. Every loop iteration is traced in first-class detail, including the final failing
    condition check that ends the loop.
 4. "changes" holds ONLY the variables created or changed by this step, each with its new value
    as a text string written the way Java shows it: "text" for Strings, 'a' for chars,
@@ -132,7 +132,7 @@ Rules:
    \\n inside the JSON string); print does not. Empty string when nothing is printed.
 7. If the program reads input (Scanner etc.), assume a small sample input, state it in
    "assumed_input", and set the variable in the step that reads it.
-8. Compute every value carefully. Never guess. Double-check arithmetic and loop conditions.
+8. **CRITICAL EXPLANATION RULE:** In "explain", explicitly show the mathematical breakdown, formula, or evaluation steps using real live values (e.g., "Add 10 + 15 to get 25" or "Check if 5 < 10, which is true"), max 22 words. Never be vague.
 9. Keep the trace at or under {MAX_STEPS} steps. Only if the full trace would be longer: trace the
    first 3 iterations of each long loop and its last iteration, and between them add ONE step on
    the loop's line with "skipped": true and an "explain" such as "Iterations 4 to 9 repeat the
@@ -259,8 +259,6 @@ pacer = TokenPacer(TPM_BUDGET)
 
 
 def make_storyboard(code: str, language: str) -> tuple[Storyboard, int]:
-    """Returns (storyboard, tokens used by the FINAL request). Asks again once if the answer
-    is cut off, is not valid JSON, or fails the checks. Earlier requests are recorded here."""
     n_lines = len(code.splitlines())
     user_msg = (f"Language: {language}\n\nSource code ({n_lines} lines):\n\n{numbered(code)}")
     extra = ""
@@ -283,8 +281,6 @@ def make_storyboard(code: str, language: str) -> tuple[Storyboard, int]:
         try:
             response = client.chat.completions.create(**kwargs)
         except BadRequestError:
-            # JSON mode refused (or the model produced invalid JSON): try again without it,
-            # Pydantic still validates whatever comes back.
             kwargs.pop("response_format")
             response = client.chat.completions.create(**kwargs)
 
@@ -313,7 +309,7 @@ def make_storyboard(code: str, language: str) -> tuple[Storyboard, int]:
             pacer.wait()
             extra = ("\n\nYour previous answer was rejected: " + "; ".join(problems) +
                      f". Return the complete JSON again with at most {max(10, VIDEO_MAX_STEPS // 2)} "
-                     "steps and explanations under 12 words.")
+                     "steps and explanations under 15 words with math breakdowns.")
 
     raise StoryboardError("; ".join(problems))
 
@@ -356,13 +352,13 @@ def load_font(names: list[str], size: int):
 
 class Fonts:
     def __init__(self):
-        self.mono = load_font(MONO_NAMES, 19)
-        self.mono_b = load_font(MONO_B_NAMES, 19)
-        self.mono_l = load_font(MONO_NAMES, 26)
-        self.sans = load_font(SANS_NAMES, 22)
-        self.sans_b = load_font(SANS_B_NAMES, 21)
-        self.small_b = load_font(SANS_B_NAMES, 17)
-        self.cap = load_font(SANS_NAMES, 27)
+        self.mono = load_font(MONO_NAMES, 18)
+        self.mono_b = load_font(MONO_B_NAMES, 18)
+        self.mono_l = load_font(MONO_NAMES, 24)
+        self.sans = load_font(SANS_NAMES, 20)
+        self.sans_b = load_font(SANS_B_NAMES, 20)
+        self.small_b = load_font(SANS_B_NAMES, 15)
+        self.cap = load_font(SANS_NAMES, 20)
         self.sub = load_font(SANS_NAMES, 28)
         self.title = load_font(SANS_B_NAMES, 50)
 
@@ -398,30 +394,30 @@ def wrap(text: str, font, max_w: float, max_lines: int) -> list[str]:
 
 def panel(d, x, y, w, h, title, color, tag=""):
     d.rounded_rectangle([x, y, x + w, y + h], radius=12, fill=PANEL, outline=color, width=2)
-    d.rounded_rectangle([x, y, x + w, y + 34], radius=12, fill=color)
-    d.rectangle([x + 1, y + 18, x + w - 1, y + 34], fill=color)
-    d.text((x + 14, y + 5), title, font=FONTS.sans_b, fill=DARK)
+    d.rounded_rectangle([x, y, x + w, y + 32], radius=12, fill=color)
+    d.rectangle([x + 1, y + 16, x + w - 1, y + 32], fill=color)
+    d.text((x + 14, y + 4), title, font=FONTS.sans_b, fill=DARK)
     if tag:
         tw = FONTS.small_b.getlength(tag)
-        d.text((x + w - 14 - tw, y + 9), tag, font=FONTS.small_b, fill=DARK)
+        d.text((x + w - 14 - tw, y + 7), tag, font=FONTS.small_b, fill=DARK)
 
 
 def draw_code(d, src_lines, cur):
-    x, y, w, h = 24, 20, 700, 540
+    x, y, w, h = 24, 20, 700, 532
     panel(d, x, y, w, h, "CODE", BLUE)
     n = len(src_lines)
     start = 0 if n <= CODE_ROWS else max(0, min(cur - 1 - CODE_ROWS // 2, n - CODE_ROWS))
-    top = y + 46
+    top = y + 44
     for k in range(CODE_ROWS):
         idx = start + k
         if idx >= n:
             break
-        ly = top + k * 28
+        ly = top + k * 27
         is_cur = (idx + 1 == cur)
         if is_cur:
-            d.rectangle([x + 6, ly - 2, x + w - 6, ly + 25], fill=LINE_BG)
-            d.rectangle([x + 6, ly - 2, x + 10, ly + 25], fill=YELLOW)
-            d.polygon([(x + 18, ly + 3), (x + 18, ly + 20), (x + 30, ly + 11)], fill=YELLOW)
+            d.rectangle([x + 6, ly - 2, x + w - 6, ly + 24], fill=LINE_BG)
+            d.rectangle([x + 6, ly - 2, x + 10, ly + 24], fill=YELLOW)
+            d.polygon([(x + 18, ly + 3), (x + 18, ly + 19), (x + 30, ly + 11)], fill=YELLOW)
         num = str(idx + 1)
         d.text((x + 66 - FONTS.mono.getlength(num), ly), num, font=FONTS.mono, fill=DIM)
         font = FONTS.mono_b if is_cur else FONTS.mono
@@ -430,7 +426,7 @@ def draw_code(d, src_lines, cur):
 
 
 def draw_vars(d, state, changed, old):
-    x, y, w, h = 744, 20, 512, 330
+    x, y, w, h = 744, 20, 512, 310
     panel(d, x, y, w, h, "VARIABLES", YELLOW)
     names = list(state.keys())
     hidden = 0
@@ -445,14 +441,14 @@ def draw_vars(d, state, changed, old):
         hidden = len(names) - len(keep)
         names = [n for n in names if n in keep]
     if not names:
-        d.text((x + 16, y + 52), "(no variables yet)", font=FONTS.mono, fill=DIM)
+        d.text((x + 16, y + 48), "(no variables yet)", font=FONTS.mono, fill=DIM)
         return
     vx, vw = x + 170, w - 170 - 16
     for k, name in enumerate(names):
-        ry = y + 46 + k * 30
+        ry = y + 44 + k * 28
         is_changed = name in changed
         if is_changed:
-            d.rectangle([x + 6, ry - 3, x + w - 6, ry + 25], fill=CHANGED_BG)
+            d.rectangle([x + 6, ry - 3, x + w - 6, ry + 24], fill=CHANGED_BG)
         d.text((x + 16, ry), fit(name, FONTS.mono_b, 140), font=FONTS.mono_b, fill=YELLOW)
         value = state[name]
         if is_changed and name in old:
@@ -466,39 +462,43 @@ def draw_vars(d, state, changed, old):
             font = FONTS.mono_b if is_changed else FONTS.mono
             d.text((vx, ry), fit(value, font, vw), font=font, fill=ORANGE if is_changed else TEXT)
     if hidden:
-        d.text((x + 16, y + h - 30), f"+ {hidden} more variable(s)", font=FONTS.small_b, fill=DIM)
-
-
-def draw_output(d, console, printed_now):
-    x, y, w, h = 744, 366, 512, 194
-    panel(d, x, y, w, h, "OUTPUT", GREEN, tag="+ printed" if printed_now else "")
-    if not console:
-        d.text((x + 16, y + 52), "(nothing printed yet)", font=FONTS.mono, fill=DIM)
-        return
-    for k, line in enumerate(console.split("\n")[-OUT_ROWS:]):
-        d.text((x + 16, y + 46 + k * 28), fit(line, FONTS.mono, w - 32), font=FONTS.mono, fill=GREEN_TEXT)
+        d.text((x + 16, y + h - 26), f"+ {hidden} more variable(s)", font=FONTS.small_b, fill=DIM)
 
 
 def draw_caption(d, idx, total, text, skipped):
-    x, y, w, h = 24, 578, 1232, 116
-    d.rounded_rectangle([x, y, x + w, y + h], radius=12, fill=PANEL,
-                        outline=ORANGE if skipped else BAR_BG, width=2)
-    d.rectangle([x, y + 10, x + 6, y + h - 10], fill=ORANGE if skipped else BLUE)
-    label = f"STEP {idx} / {total}" + ("   (SKIPPED TO KEEP THE VIDEO SHORT)" if skipped else "")
-    d.text((x + 24, y + 10), label, font=FONTS.small_b, fill=ORANGE if skipped else DIM)
-    for k, line in enumerate(wrap(text, FONTS.cap, w - 48, 2)):
-        d.text((x + 24, y + 36 + k * 36), line, font=FONTS.cap, fill=WHITE)
-    d.rectangle([24, 704, 24 + 1232, 712], fill=BAR_BG)
-    d.rectangle([24, 704, 24 + int(1232 * idx / max(total, 1)), 712], fill=BLUE)
+    x, y, w, h = 744, 342, 512, 210
+    panel(d, x, y, w, h, "EXPLANATION & MATH", BLUE, tag=f"STEP {idx} / {total}")
+    if skipped:
+        d.text((x + 16, y + 42), "SKIPPED TO KEEP VIDEO SHORT", font=FONTS.small_b, fill=ORANGE)
+        offset = 24
+    else:
+        offset = 0
+    for k, line in enumerate(wrap(text, FONTS.cap, w - 32, 5)):
+        d.text((x + 16, y + 46 + offset + k * 28), line, font=FONTS.cap, fill=WHITE)
 
 
-def step_frame(src_lines, cur, state, changed, old, console, printed_now, caption, idx, total, skipped):
+def draw_output(d, console, printed_now, assumed_input):
+    x, y, w, h = 24, 564, 1232, 128
+    tag = "+ printed" if printed_now else ("Input: " + assumed_input if assumed_input else "")
+    panel(d, x, y, w, h, "OUTPUT & INPUT CONSOLE", GREEN, tag=tag)
+    if not console:
+        display_text = f"(no output yet | Assumed Input: {assumed_input})" if assumed_input else "(nothing printed yet)"
+        d.text((x + 16, y + 44), fit(display_text, FONTS.mono, w - 32), font=FONTS.mono, fill=DIM)
+        return
+    for k, line in enumerate(console.split("\n")[-OUT_ROWS:]):
+        d.text((x + 16, y + 44 + k * 26), fit(line, FONTS.mono, w - 32), font=FONTS.mono, fill=GREEN_TEXT)
+
+
+def step_frame(src_lines, cur, state, changed, old, console, printed_now, caption, idx, total, skipped, assumed_input):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
     draw_code(d, src_lines, cur)
     draw_vars(d, state, changed, old)
-    draw_output(d, console, printed_now)
     draw_caption(d, idx, total, caption, skipped)
+    draw_output(d, console, printed_now, assumed_input)
+    # Progress bar at the very bottom
+    d.rectangle([24, 704, 24 + 1232, 712], fill=BAR_BG)
+    d.rectangle([24, 704, 24 + int(1232 * idx / max(total, 1)), 712], fill=BLUE)
     return img
 
 
@@ -526,9 +526,9 @@ def title_frame(sb: Storyboard, total_steps: int):
                font=FONTS.mono, fill=YELLOW)
 
     ly = H - 170
-    legend = [(BLUE, "Code: the highlighted line is the one being run"),
+    legend = [(BLUE, "Code & Math: highlighted line and explicit calculation breakdown"),
               (YELLOW, "Variables: orange means the value just changed (old -> new)"),
-              (GREEN, "Output: what the program has printed so far")]
+              (GREEN, "Output & Input: terminal console and inputs fed to program")]
     for color, label in legend:
         d.rounded_rectangle([80, ly + 4, 106, ly + 30], radius=5, fill=color)
         d.text((122, ly), label, font=FONTS.sans, fill=TEXT)
@@ -538,29 +538,36 @@ def title_frame(sb: Storyboard, total_steps: int):
     return img
 
 
-def final_frame(final_text: str):
+def final_frame(final_text: str, assumed_input: str):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
-    x, y, w, h = 80, 70, W - 160, 500
-    panel(d, x, y, w, h, "FINAL OUTPUT", GREEN)
+    x, y, w, h = 80, 50, W - 160, 530
+    panel(d, x, y, w, h, "FINAL OUTPUT & INPUT SUMMARY", GREEN)
+    
+    current_y = y + 46
+    if assumed_input.strip():
+        d.text((x + 24, current_y), fit("Assumed Input: " + assumed_input, FONTS.mono_b, w - 48), font=FONTS.mono_b, fill=YELLOW)
+        current_y += 36
+        d.line([(x + 24, current_y), (x + w - 24, current_y)], fill=LINE_BG, width=2)
+        current_y += 18
+
     lines = final_text.rstrip("\n").split("\n") if final_text.strip() else ["(the program prints nothing)"]
-    if len(lines) > 11:
-        lines = lines[:10] + ["..."]
+    if len(lines) > 9:
+        lines = lines[:8] + ["..."]
     for k, line in enumerate(lines):
-        d.text((x + 24, y + 56 + k * 38), fit(line, FONTS.mono_l, w - 48), font=FONTS.mono_l, fill=GREEN_TEXT)
-    d.text((80, H - 80), "Dry run complete", font=FONTS.sans_b, fill=DIM)
+        d.text((x + 24, current_y + k * 36), fit(line, FONTS.mono_l, w - 48), font=FONTS.mono_l, fill=GREEN_TEXT)
+        
+    d.text((80, H - 70), "Dry run complete", font=FONTS.sans_b, fill=DIM)
     return img
 
 
 # ---------- Video ----------
 
 def post_seconds(explain: str) -> float:
-    """How long a finished step stays on screen, based on how much there is to read."""
     return min(MAX_STEP_SECONDS, max(MIN_STEP_SECONDS, 1.0 + 0.045 * len(explain)))
 
 
 def render_video(code: str, sb: Storyboard, out_path: Path) -> float:
-    """Draws every step and writes the MP4. Returns the video length in seconds."""
     global FONTS
     if FONTS is None:
         FONTS = Fonts()
@@ -569,15 +576,9 @@ def render_video(code: str, sb: Storyboard, out_path: Path) -> float:
     steps = sb.steps
     total = len(steps)
 
-    # Cross-check: what the steps print must match final_output
     printed_all = "".join(s.printed.replace("\\n", "\n") for s in steps)
     final_text = printed_all if printed_all.strip() else sb.final_output
-    if printed_all.strip() and sb.final_output.strip() and printed_all.strip() != sb.final_output.strip():
-        print("   Note: final_output did not match the printed steps; the video uses the printed steps.")
-    if not printed_all.strip() and sb.final_output.strip():
-        print("   Note: no step had printed text, so the output panel stays empty until the end.")
 
-    # Speed-up so the whole video fits the target length
     raw_total = sum(post_seconds(s.explain) + PRE_SECONDS for s in steps)
     budget = max(5.0, VIDEO_TARGET_SECONDS - TITLE_SECONDS - FINAL_SECONDS)
     scale = min(1.0, max(MIN_SCALE, budget / raw_total))
@@ -611,17 +612,17 @@ def render_video(code: str, sb: Storyboard, out_path: Path) -> float:
             post_s = max(MIN_POST_SECONDS, post_seconds(st.explain) * scale)
 
             first = step_frame(src_lines, st.line, before, set(), {}, console, False,
-                               caption, i, total, st.skipped)
+                               caption, i, total, st.skipped, sb.assumed_input)
             if not changed and not printed and not removed_any:
-                add(first, pre_s + post_s)          # nothing changes: one steady frame
+                add(first, pre_s + post_s)
             else:
-                add(first, pre_s)                   # the line is about to run
+                add(first, pre_s)
                 add(step_frame(src_lines, st.line, state, changed, before, console_after,
-                               bool(printed), caption, i, total, st.skipped), post_s)
+                               bool(printed), caption, i, total, st.skipped, sb.assumed_input), post_s)
             seconds += pre_s + post_s
             console = console_after
 
-        add(final_frame(final_text), FINAL_SECONDS)
+        add(final_frame(final_text, sb.assumed_input), FINAL_SECONDS)
 
     return seconds
 
@@ -644,7 +645,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     target = Path((args.path or input("Enter path to a file or folder: "))
-                  .strip().strip('"').strip("'")).expanduser()
+                  .strip().strip('"'.strip("'"))).expanduser()
 
     files = collect_files(target, args.recursive)
     if not files:
@@ -721,10 +722,10 @@ if __name__ == "__main__":
 
     print(f"\nFinished: {len(made)} video(s), {len(failed)} failed, {len(not_attempted)} not attempted.")
     for path, seconds, n_steps in made:
-        print(f"  + {path}  ({seconds:.0f}s, {n_steps} steps)")
+        print(f"   + {path}  ({seconds:.0f}s, {n_steps} steps)")
     for name, err in failed:
-        print(f"  - {name}: {err}")
+        print(f"   - {name}: {err}")
     if daily_limit_hit:
         print("\nThe free daily limit was reached. Run these files again after it resets:")
         for f in not_attempted:
-            print(f"  - {f}")
+            print(f"   - {f}")
