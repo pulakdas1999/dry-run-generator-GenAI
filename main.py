@@ -2,8 +2,7 @@ import os
 import re
 import sys
 import time
-import json
-import hashlib
+import html
 import argparse
 from collections import deque
 from datetime import date
@@ -15,7 +14,6 @@ from openai import OpenAI, RateLimitError, AuthenticationError
 from playwright.sync_api import sync_playwright
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
-CACHE_FILE = OUTPUT_DIR / ".dryrun_cache.json"   # one hidden file holding finished dry runs, so reruns skip them
 
 # Make emoji print correctly on Windows terminals
 if hasattr(sys.stdout, "reconfigure"):
@@ -30,7 +28,7 @@ BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 REASONING_EFFORT = os.getenv("LLM_REASONING", "low")      # low | medium | high (gpt-oss models only)
 TPM_BUDGET = int(os.getenv("LLM_TPM_BUDGET", "7000"))     # stay under Groq's 8K tokens/minute free limit
-MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "4000"))
+MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "5000"))
 
 COOLDOWN_SECONDS = 60   # wait after an unexpected API error, then move on to the next file
 MAX_RETRIES = 3         # per-minute rate-limit retries for the same file
@@ -68,9 +66,11 @@ each loop, each method call). Finish with one final "🟩 FINAL OUTPUT" block.
 
 ## Rules for the dry run
 1. Start with a one-line "🟦 INPUT" section: state each input, its data type and its initial value.
-2. Use a trace table for every loop or sequence of changing variables:
-   | Step | Line | Variables after this step | What happened |
-   Keep the "What happened" column to a few words, e.g. "c = a + b = 1 + 1 = 2".
+2. Use a trace table for every loop. ONE ROW PER ITERATION, never fewer:
+   | Iter | Condition check | Variables after the iteration | What happened (lines executed) |
+   The last column lists every statement run in that iteration with real values, e.g.
+   "L9: 3 % 2 = 1 → result = "101"; L10: decimal = 3 / 2 = 1".
+   Always finish with one extra row for the failing condition check that ends the loop.
 3. Use simple ASCII diagrams whenever they make things clearer:
    - Arrays/lists: show cells and mark pointers, e.g.
        index:  0   1   2   3
@@ -80,10 +80,13 @@ each loop, each method call). Finish with one final "🟩 FINAL OUTPUT" block.
    - Objects/linked lists: show boxes and arrows (A -> B -> C -> null).
 4. Be concise, with no filler and no long paragraphs. But NEVER skip any value that
    affects the output. Every printed line must appear in the trace.
-5. For long loops (more than 8 iterations): show the first 3 iterations and the last
-   iteration in full, then write "... iterations 4 to N-1 follow the same pattern ..." and
-   give the pattern as a one-line formula. Still state the final variable values and the
-   complete output.
+5. NEVER skip, merge or summarise steps. Write out EVERY iteration of EVERY loop and every
+   recursive call, from the first to the last, one row each. Never use "...", "…", "and so on",
+   "same pattern", "iterations X to N", "N-1" or any phrase that stands in for rows.
+   Row numbers must run 1, 2, 3 ... with no gaps. Before finishing, count the rows and
+   check the count equals the real number of iterations.
+   Only if a loop would run more than 60 iterations: trace the first 30 and the last 5 in
+   full, and add a 🟥 NOTE stating exactly which iterations were left out.
 6. Compute every value carefully and double-check arithmetic. Never guess a value.
 7. If the code has no fixed input (e.g. it uses Scanner), assume a small sample input,
    and state clearly at the top what you assumed.
@@ -143,31 +146,59 @@ class TokenPacer:
 pacer = TokenPacer(TPM_BUDGET)
 
 
+# Phrases that mean "I summarised instead of writing every row".
+# Deliberately NOT matching a bare "n - 1": that appears in normal code such as fact(n - 1).
+SKIP_WORDS = re.compile(
+    r"same pattern|and so on|remaining iterations|continues? similarly|follows? the same", re.I)
+SKIP_RANGE = re.compile(r"iterations?\s*\d+\s*(?:to|[-\u2010-\u2015])\s*N\b")   # "iterations 4 to N-1"
+ELLIPSIS_CELL = re.compile(r"\|\s*(?:\.{2,}|…)\s*(?=\|)")                     # a table cell that is just "..."
+
+REDO_NOTE = ("\n\nIMPORTANT: a previous answer skipped iterations. Write out EVERY iteration "
+             "as its own table row. No ellipsis rows and no 'same pattern' shortcuts.")
+
+
+def has_skipped_steps(text: str) -> bool:
+    return bool(SKIP_WORDS.search(text) or SKIP_RANGE.search(text) or ELLIPSIS_CELL.search(text))
+
+
 def dry_run(code: str, language: str = "Java") -> tuple[str, int]:
-    """Returns (markdown text, total tokens used)."""
-    kwargs = dict(
-        model=MODEL,
-        temperature=0.2,
-        max_completion_tokens=MAX_OUTPUT_TOKENS,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",
-             "content": f"Language: {language}\n\nDry run this code:\n\n```{language.lower()}\n{code}\n```"},
-        ],
-    )
-    if "gpt-oss" in MODEL:
-        kwargs["extra_body"] = {"reasoning_effort": REASONING_EFFORT}
+    """Returns (markdown text, tokens used by the FINAL request).
+    If steps were skipped, asks once more. Earlier requests are recorded in the pacer here,
+    and the caller records the last one, so nothing is counted twice."""
+    user_msg = f"Language: {language}\n\nDry run this code:\n\n```{language.lower()}\n{code}\n```"
 
-    response = client.chat.completions.create(**kwargs)
-    choice = response.choices[0]
-    text = choice.message.content or ""
+    for attempt in range(2):
+        kwargs = dict(
+            model=MODEL,
+            temperature=0.2,
+            max_completion_tokens=MAX_OUTPUT_TOKENS,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg + (REDO_NOTE if attempt else "")},
+            ],
+        )
+        if "gpt-oss" in MODEL:
+            kwargs["extra_body"] = {"reasoning_effort": REASONING_EFFORT}
 
-    if choice.finish_reason == "length":
-        text += ("\n\n🟥 NOTE\n\nThe model's answer was cut off because it hit the output limit. "
-                 "Increase LLM_MAX_OUTPUT_TOKENS in .env to get the full trace.")
+        response = client.chat.completions.create(**kwargs)
+        choice = response.choices[0]
+        text = choice.message.content or ""
+        used = response.usage.total_tokens if response.usage else pacer.estimate
 
-    tokens = response.usage.total_tokens if response.usage else pacer.estimate
-    return text, tokens
+        if choice.finish_reason == "length":
+            text += ("\n\n🟥 NOTE\n\nThe model's answer was cut off because it hit the output limit. "
+                     "Increase LLM_MAX_OUTPUT_TOKENS in .env to get the full trace.")
+            return text, used
+        if not has_skipped_steps(text):
+            return text, used
+        if attempt == 0:
+            print("   Steps were skipped, asking again...")
+            pacer.record(used)
+            pacer.wait()
+
+    text += ("\n\n🟥 NOTE\n\nThe model still abbreviated some steps after a second attempt, "
+             "so this trace may not show every iteration.")
+    return text, used
 
 
 def is_daily_limit(err: Exception) -> bool:
@@ -181,19 +212,6 @@ def retry_after_seconds(err: Exception, default: float = 60) -> float:
         return max(float(value), 5) if value else default
     except Exception:
         return default
-
-
-# ---------- Saved results (one hidden JSON file, no .md files) ----------
-
-def load_cache() -> dict:
-    try:
-        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_cache(cache: dict) -> None:
-    CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
 
 
 # ---------- Formatting ----------
@@ -237,6 +255,16 @@ def normalize(text: str) -> str:
     return text
 
 
+CODE_SPANS = re.compile(r"(```.*?```|`[^`\n]+`)", re.S)
+
+
+def escape_angle_brackets(text: str) -> str:
+    """Markdown treats <String> as an HTML tag and hides it. Escape '<' everywhere except
+    inside code blocks/spans, which Markdown already escapes itself."""
+    parts = CODE_SPANS.split(text)
+    return "".join(p if i % 2 else p.replace("<", "&lt;") for i, p in enumerate(parts))
+
+
 def to_body(text: str) -> str:
     """Convert one dry-run Markdown result into coloured section blocks."""
     chunks = re.split(rf"(?m)^(?=[{MARKERS}])", normalize(text))
@@ -246,15 +274,15 @@ def to_body(text: str) -> str:
             continue
         cls = COLOURS.get(chunk.strip()[0], "")
         first, _, rest = chunk.partition("\n")
-        html = md.markdown(rest, extensions=["tables", "fenced_code"])
-        body += f'<div class="sec {cls}"><h4>{first.strip()}</h4>{html}</div>\n'
+        rendered = md.markdown(escape_angle_brackets(rest), extensions=["tables", "fenced_code"])
+        body += f'<div class="sec {cls}"><h4>{html.escape(first.strip())}</h4>{rendered}</div>\n'
     return body
 
 
 def build_document(programs: list[tuple[str, str]], today: str) -> str:
     """programs = [(file name, section html), ...] -> one HTML document."""
     parts = "".join(
-        f'<section class="program"><h2>{name}</h2>{body}</section>\n'
+        f'<section class="program"><h2>{html.escape(name)}</h2>{body}</section>\n'
         for name, body in programs
     )
     return (
@@ -278,8 +306,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dry run Java files with an LLM and save one PDF.")
     parser.add_argument("path", nargs="?", help="A Java file OR a folder containing Java files")
     parser.add_argument("-r", "--recursive", action="store_true", help="Also search sub-folders")
-    parser.add_argument("--fresh", action="store_true",
-                        help="Ignore saved results and regenerate every file")
     args = parser.parse_args()
 
     target = Path((args.path or input("Enter path to a file or folder: "))
@@ -291,9 +317,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    cache = {} if args.fresh else load_cache()
     today = date.today().strftime("%Y-%m-%d")
-    pdf_path = OUTPUT_DIR / f"DryRun_{today}.pdf"
+    base_name = target.stem if target.is_file() else target.resolve().name
+    pdf_path = OUTPUT_DIR / f"{base_name}.pdf"
     print(f"Model: {MODEL}")
     print(f"Found {len(files)} file(s). Building: {pdf_path}\n")
 
@@ -309,13 +335,6 @@ if __name__ == "__main__":
         except Exception as e:
             failed.append((src.name, str(e)))
             print(f"   SKIPPED: {e}")
-            continue
-
-        # Already done earlier (e.g. yesterday)? Reuse it, no API call needed
-        cache_key = f"{src.stem}_{hashlib.sha1(code.encode('utf-8')).hexdigest()[:8]}"
-        if cache_key in cache:
-            programs.append((src.name, to_body(cache[cache_key])))
-            print("   loaded from saved results")
             continue
 
         result = None
@@ -351,8 +370,6 @@ if __name__ == "__main__":
             break
 
         if result is not None:
-            cache[cache_key] = result
-            save_cache(cache)
             programs.append((src.name, to_body(result)))
             print("   done")
 
@@ -372,5 +389,6 @@ if __name__ == "__main__":
     for name, err in failed:
         print(f"  - {name}: {err}")
     if daily_limit_hit:
-        print("\nThe free daily limit was reached. Run the same command again after it resets;")
-        print("finished files are remembered and will be reused, so only the remaining ones are sent.")
+        print("\nThe free daily limit was reached. Run these files again after it resets:")
+        for f in not_attempted:
+            print(f"  - {f}")
